@@ -1,5 +1,5 @@
 <script setup>
-import { ref, nextTick } from 'vue'
+import { ref, nextTick, computed } from 'vue'
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib'
 import * as pdfjsLib from 'pdfjs-dist'
 
@@ -18,6 +18,23 @@ const fileName = ref('')
 const selectedOverlay = ref(null)
 const isAddingText = ref(false)
 
+// Existing text items extracted from the PDF
+const existingTextItems = ref([])
+// Track which existing text items have been edited (by page)
+const editedTextItems = ref({})
+// Currently selected existing text item
+const selectedTextItem = ref(null)
+// Edit mode: 'add' for adding new overlays, 'edit' for editing existing text
+const editMode = ref('edit')
+// Text layer container ref
+const textLayerContainer = ref(null)
+
+// Zoom percentage display
+const zoomPercent = computed(() => Math.round(scale.value * 100))
+
+// Available zoom levels
+const zoomLevels = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4, 5]
+
 // Load PDF file
 async function handleFileUpload(event) {
   const file = event.target.files[0]
@@ -34,8 +51,11 @@ async function handleFileUpload(event) {
     pdfDoc.value = await PDFDocument.load(pdfBytes.value)
     totalPages.value = pdfDoc.value.getPageCount()
 
-    // Reset overlays when loading new PDF
+    // Reset overlays and edits when loading new PDF
     textOverlays.value = []
+    editedTextItems.value = {}
+    existingTextItems.value = []
+    selectedTextItem.value = null
 
     await renderPage()
   } catch (error) {
@@ -46,7 +66,7 @@ async function handleFileUpload(event) {
   }
 }
 
-// Render current page
+// Render current page and extract text
 async function renderPage() {
   if (!pdfBytes.value) return
 
@@ -64,12 +84,124 @@ async function renderPage() {
     canvasContext: ctx,
     viewport: viewport
   }).promise
+
+  // Extract text content for editing
+  await extractTextItems(page, viewport)
 }
+
+// Extract text items from the current page
+async function extractTextItems(page, viewport) {
+  const textContent = await page.getTextContent()
+  const items = []
+
+  for (let i = 0; i < textContent.items.length; i++) {
+    const item = textContent.items[i]
+    if (!item.str || item.str.trim() === '') continue
+
+    // Transform the text item position using the viewport
+    const tx = pdfjsLib.Util.transform(viewport.transform, item.transform)
+
+    // tx[4] = x, tx[5] = y (bottom-left origin in PDF, but transformed to canvas coords)
+    const x = tx[4]
+    const y = tx[5]
+    const fontSize = Math.sqrt(tx[2] * tx[2] + tx[3] * tx[3])
+    const width = item.width * viewport.scale
+    const height = item.height * viewport.scale
+
+    const pageKey = currentPage.value
+    const itemKey = `${pageKey}-${i}`
+
+    // Check if this item has been edited before
+    const edited = editedTextItems.value[itemKey]
+
+    items.push({
+      id: itemKey,
+      index: i,
+      originalText: item.str,
+      text: edited ? edited.text : item.str,
+      x,
+      y: y - height, // adjust to top-left
+      width,
+      height: Math.max(height, fontSize),
+      fontSize,
+      page: currentPage.value,
+      isEdited: !!edited,
+      fontName: item.fontName || 'Helvetica',
+      // Store original PDF coordinates for saving
+      pdfX: item.transform[4],
+      pdfY: item.transform[5],
+      pdfFontSize: Math.sqrt(item.transform[2] * item.transform[2] + item.transform[3] * item.transform[3]),
+      pdfWidth: item.width,
+      pdfHeight: item.height,
+    })
+  }
+
+  existingTextItems.value = items
+}
+
+// Click on an existing text item to edit it
+function selectTextItem(event, item) {
+  event.stopPropagation()
+  selectedTextItem.value = item.id
+  selectedOverlay.value = null
+}
+
+// Start editing text item inline
+function startEditingTextItem(event, item) {
+  event.stopPropagation()
+  item.isEditing = true
+
+  nextTick(() => {
+    const input = document.querySelector(`[data-text-item-id="${item.id}"] input`)
+    if (input) {
+      input.focus()
+      input.select()
+    }
+  })
+}
+
+// Finish editing a text item
+function finishEditingTextItem(item) {
+  item.isEditing = false
+
+  const itemKey = item.id
+
+  if (item.text !== item.originalText) {
+    item.isEdited = true
+    editedTextItems.value[itemKey] = {
+      text: item.text,
+      originalText: item.originalText,
+      pdfX: item.pdfX,
+      pdfY: item.pdfY,
+      pdfFontSize: item.pdfFontSize,
+      pdfWidth: item.pdfWidth,
+      pdfHeight: item.pdfHeight,
+      fontName: item.fontName,
+      page: item.page,
+    }
+  } else {
+    // Reverted to original, remove from edits
+    item.isEdited = false
+    delete editedTextItems.value[itemKey]
+  }
+}
+
+// Revert a text item to its original text
+function revertTextItem(item) {
+  item.text = item.originalText
+  item.isEdited = false
+  delete editedTextItems.value[item.id]
+  selectedTextItem.value = null
+}
+
+// Count of edited items
+const editedCount = computed(() => Object.keys(editedTextItems.value).length)
 
 // Go to previous page
 function prevPage() {
   if (currentPage.value > 1) {
     currentPage.value--
+    selectedTextItem.value = null
     renderPage()
   }
 }
@@ -78,12 +210,46 @@ function prevPage() {
 function nextPage() {
   if (currentPage.value < totalPages.value) {
     currentPage.value++
+    selectedTextItem.value = null
     renderPage()
+  }
+}
+
+// Zoom in
+function zoomIn() {
+  const idx = zoomLevels.findIndex(z => z >= scale.value)
+  if (idx < zoomLevels.length - 1) {
+    scale.value = zoomLevels[idx + 1]
+    renderPage()
+  }
+}
+
+// Zoom out
+function zoomOut() {
+  const idx = zoomLevels.findIndex(z => z >= scale.value)
+  if (idx > 0) {
+    scale.value = zoomLevels[idx - 1]
+    renderPage()
+  }
+}
+
+// Handle mouse wheel zoom
+function handleWheel(event) {
+  if (event.ctrlKey || event.metaKey) {
+    event.preventDefault()
+    if (event.deltaY < 0) {
+      zoomIn()
+    } else {
+      zoomOut()
+    }
   }
 }
 
 // Handle canvas click to add text
 function handleCanvasClick(event) {
+  // Deselect existing text item
+  selectedTextItem.value = null
+
   if (!isAddingText.value) return
 
   const rect = canvas.value.getBoundingClientRect()
@@ -180,7 +346,33 @@ async function savePdf() {
     const newPdfDoc = await PDFDocument.load(pdfBytes.value)
     const helveticaFont = await newPdfDoc.embedFont(StandardFonts.Helvetica)
 
-    // Apply text overlays to the PDF
+    // Apply edited existing text items
+    for (const [, edit] of Object.entries(editedTextItems.value)) {
+      const page = newPdfDoc.getPage(edit.page - 1)
+      page.getSize() // ensure page is valid
+
+      // Draw a white rectangle over the original text to "erase" it
+      const rectPadding = 2
+      page.drawRectangle({
+        x: edit.pdfX - rectPadding,
+        y: edit.pdfY - edit.pdfFontSize * 0.3 - rectPadding,
+        width: edit.pdfWidth + rectPadding * 2,
+        height: edit.pdfFontSize * 1.3 + rectPadding * 2,
+        color: rgb(1, 1, 1), // white
+        borderWidth: 0,
+      })
+
+      // Draw the new text
+      page.drawText(edit.text, {
+        x: edit.pdfX,
+        y: edit.pdfY,
+        size: edit.pdfFontSize,
+        font: helveticaFont,
+        color: rgb(0, 0, 0),
+      })
+    }
+
+    // Apply new text overlays to the PDF
     for (const overlay of textOverlays.value) {
       const page = newPdfDoc.getPage(overlay.page - 1)
       const { height } = page.getSize()
@@ -247,11 +439,28 @@ async function savePdf() {
 // Toggle add text mode
 function toggleAddText() {
   isAddingText.value = !isAddingText.value
+  if (isAddingText.value) {
+    editMode.value = 'add'
+    selectedTextItem.value = null
+  }
+}
+
+// Toggle edit existing text mode
+function toggleEditMode() {
+  editMode.value = editMode.value === 'edit' ? 'view' : 'edit'
+  isAddingText.value = false
+  selectedTextItem.value = null
+  selectedOverlay.value = null
 }
 
 // Get overlays for current page
 function getCurrentPageOverlays() {
   return textOverlays.value.filter(o => o.page === currentPage.value)
+}
+
+// Get existing text items for current page
+function getCurrentPageTextItems() {
+  return existingTextItems.value.filter(o => o.page === currentPage.value)
 }
 </script>
 
@@ -267,6 +476,13 @@ function getCurrentPageOverlays() {
 
       <div class="toolbar-section" v-if="pdfDoc">
         <button
+          @click="toggleEditMode"
+          :class="{ active: editMode === 'edit' }"
+          title="Click on existing text in the PDF to edit it"
+        >
+          🔤 Edit Text
+        </button>
+        <button
           @click="toggleAddText"
           :class="{ active: isAddingText }"
           title="Click to add text, then click on the PDF"
@@ -276,6 +492,9 @@ function getCurrentPageOverlays() {
         <button @click="savePdf" :disabled="isLoading">
           💾 Save PDF
         </button>
+        <span v-if="editedCount > 0" class="edit-badge" title="Number of edited text items">
+          {{ editedCount }} edit{{ editedCount > 1 ? 's' : '' }}
+        </span>
       </div>
 
       <div class="toolbar-section" v-if="pdfDoc">
@@ -284,17 +503,23 @@ function getCurrentPageOverlays() {
         <button @click="nextPage" :disabled="currentPage >= totalPages">▶</button>
       </div>
 
-      <div class="toolbar-section" v-if="pdfDoc">
-        <label>
-          Zoom:
-          <select v-model.number="scale" @change="renderPage">
-            <option :value="0.5">50%</option>
-            <option :value="0.75">75%</option>
-            <option :value="1">100%</option>
-            <option :value="1.5">150%</option>
-            <option :value="2">200%</option>
-          </select>
-        </label>
+      <div class="toolbar-section zoom-section" v-if="pdfDoc">
+        <button @click="zoomOut" title="Zoom Out" :disabled="scale <= zoomLevels[0]">➖</button>
+        <span class="zoom-display">{{ zoomPercent }}%</span>
+        <button @click="zoomIn" title="Zoom In" :disabled="scale >= zoomLevels[zoomLevels.length - 1]">➕</button>
+        <select v-model.number="scale" @change="renderPage" class="zoom-select">
+          <option :value="0.25">25%</option>
+          <option :value="0.5">50%</option>
+          <option :value="0.75">75%</option>
+          <option :value="1">100%</option>
+          <option :value="1.25">125%</option>
+          <option :value="1.5">150%</option>
+          <option :value="2">200%</option>
+          <option :value="2.5">250%</option>
+          <option :value="3">300%</option>
+          <option :value="4">400%</option>
+          <option :value="5">500%</option>
+        </select>
       </div>
     </div>
 
@@ -305,12 +530,14 @@ function getCurrentPageOverlays() {
     <div v-if="!pdfDoc && !isLoading" class="drop-zone">
       <p>📄 Open a PDF file to start editing</p>
       <p class="hint">Click "Open PDF" button above</p>
+      <p class="hint">Then use 🔤 Edit Text to click on existing labels and fix them</p>
     </div>
 
     <div
       v-if="pdfDoc"
       class="canvas-container"
-      :class="{ 'adding-text': isAddingText }"
+      :class="{ 'adding-text': isAddingText, 'edit-mode': editMode === 'edit' }"
+      @wheel="handleWheel"
     >
       <div class="canvas-wrapper">
         <canvas
@@ -318,7 +545,68 @@ function getCurrentPageOverlays() {
           @click="handleCanvasClick"
         ></canvas>
 
-        <!-- Text overlays -->
+        <!-- Existing text items layer (for editing) -->
+        <div
+          v-if="editMode === 'edit'"
+          class="text-layer"
+          ref="textLayerContainer"
+        >
+          <div
+            v-for="item in getCurrentPageTextItems()"
+            :key="item.id"
+            :data-text-item-id="item.id"
+            class="existing-text-item"
+            :class="{
+              selected: selectedTextItem === item.id,
+              edited: item.isEdited,
+            }"
+            :style="{
+              left: item.x + 'px',
+              top: item.y + 'px',
+              width: item.width + 'px',
+              height: item.height + 'px',
+              fontSize: item.fontSize + 'px',
+              lineHeight: item.height + 'px',
+            }"
+            @click="selectTextItem($event, item)"
+            @dblclick="startEditingTextItem($event, item)"
+          >
+            <input
+              v-if="item.isEditing"
+              v-model="item.text"
+              :style="{
+                fontSize: item.fontSize + 'px',
+                width: Math.max(item.width, 100) + 'px',
+                height: item.height + 'px',
+              }"
+              class="text-item-input"
+              @blur="finishEditingTextItem(item)"
+              @keydown.enter="finishEditingTextItem(item)"
+              @click.stop
+            />
+            <span v-else class="text-item-label">{{ item.text }}</span>
+
+            <!-- Controls for selected text item -->
+            <div v-if="selectedTextItem === item.id && !item.isEditing" class="text-item-controls">
+              <button
+                @click.stop="startEditingTextItem($event, item)"
+                title="Edit text"
+                class="ctrl-btn"
+              >✏️ Edit</button>
+              <button
+                v-if="item.isEdited"
+                @click.stop="revertTextItem(item)"
+                title="Revert to original"
+                class="ctrl-btn revert-btn"
+              >↩️ Revert</button>
+              <span class="original-text" v-if="item.isEdited" title="Original text">
+                was: "{{ item.originalText }}"
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <!-- New text overlays -->
         <div
           v-for="overlay in getCurrentPageOverlays()"
           :key="overlay.id"
@@ -436,6 +724,10 @@ function getCurrentPageOverlays() {
     <div v-if="isAddingText" class="add-text-hint">
       Click anywhere on the PDF to add text
     </div>
+
+    <div v-if="editMode === 'edit' && pdfDoc" class="edit-mode-hint">
+      🔤 Edit mode: Click on text to select, double-click to edit. Ctrl+Scroll to zoom.
+    </div>
   </div>
 </template>
 
@@ -498,6 +790,37 @@ function getCurrentPageOverlays() {
   background: #e94560;
 }
 
+.edit-badge {
+  background: #e94560;
+  color: white;
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: bold;
+}
+
+.zoom-section {
+  gap: 4px;
+}
+
+.zoom-display {
+  min-width: 50px;
+  text-align: center;
+  font-size: 14px;
+  font-weight: bold;
+  padding: 0 4px;
+}
+
+.zoom-select {
+  padding: 6px 10px;
+  background: #0f3460;
+  border: 1px solid #0f3460;
+  border-radius: 4px;
+  color: #eee;
+  cursor: pointer;
+  font-size: 12px;
+}
+
 .page-info {
   padding: 0 10px;
   font-size: 14px;
@@ -548,6 +871,10 @@ function getCurrentPageOverlays() {
   cursor: crosshair;
 }
 
+.canvas-container.edit-mode {
+  cursor: default;
+}
+
 .canvas-wrapper {
   position: relative;
   box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
@@ -558,6 +885,121 @@ canvas {
   background: white;
 }
 
+/* ---- Existing text items layer ---- */
+.text-layer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  pointer-events: none;
+}
+
+.existing-text-item {
+  position: absolute;
+  pointer-events: all;
+  cursor: pointer;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  transition: border-color 0.15s, background-color 0.15s;
+  box-sizing: border-box;
+  overflow: visible;
+}
+
+.existing-text-item:hover {
+  border-color: rgba(66, 135, 245, 0.5);
+  background-color: rgba(66, 135, 245, 0.08);
+}
+
+.existing-text-item.selected {
+  border-color: #4287f5;
+  background-color: rgba(66, 135, 245, 0.12);
+  z-index: 10;
+}
+
+.existing-text-item.edited {
+  border-color: #e94560;
+  background-color: rgba(233, 69, 96, 0.08);
+}
+
+.existing-text-item.edited.selected {
+  border-color: #e94560;
+  background-color: rgba(233, 69, 96, 0.15);
+}
+
+.text-item-label {
+  display: block;
+  white-space: nowrap;
+  color: transparent;
+  user-select: none;
+  pointer-events: none;
+}
+
+.existing-text-item.edited .text-item-label {
+  color: rgba(233, 69, 96, 0.6);
+  font-weight: bold;
+}
+
+.text-item-input {
+  position: absolute;
+  top: 0;
+  left: 0;
+  border: 2px solid #4287f5;
+  background: rgba(255, 255, 255, 0.95);
+  color: #000;
+  padding: 0 2px;
+  outline: none;
+  z-index: 20;
+  min-width: 120px;
+  box-sizing: border-box;
+  border-radius: 3px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.text-item-controls {
+  position: absolute;
+  top: -36px;
+  left: 0;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  background: #16213e;
+  padding: 5px 10px;
+  border-radius: 6px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
+  z-index: 100;
+  white-space: nowrap;
+}
+
+.ctrl-btn {
+  padding: 3px 8px !important;
+  font-size: 12px !important;
+  background: #0f3460 !important;
+  border: none;
+  border-radius: 4px;
+  color: #eee;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.ctrl-btn:hover {
+  background: #4287f5 !important;
+}
+
+.revert-btn:hover {
+  background: #e94560 !important;
+}
+
+.original-text {
+  font-size: 11px;
+  color: #888;
+  font-style: italic;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---- New text overlays ---- */
 .text-overlay {
   position: absolute;
   cursor: move;
@@ -710,11 +1152,24 @@ canvas {
   animation: pulse 1.5s infinite;
 }
 
+.edit-mode-hint {
+  position: fixed;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #0f3460;
+  color: #ccc;
+  padding: 8px 20px;
+  border-radius: 20px;
+  font-size: 13px;
+  border: 1px solid #4287f5;
+  pointer-events: none;
+}
+
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.7; }
 }
 </style>
-
 
 
