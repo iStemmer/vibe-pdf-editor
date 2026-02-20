@@ -351,13 +351,16 @@ async function savePdf() {
       const page = newPdfDoc.getPage(edit.page - 1)
       page.getSize() // ensure page is valid
 
-      // Draw a white rectangle over the original text to "erase" it
-      const rectPadding = 2
+      // Draw a tight white rectangle over the original text to "erase" it
+      // Use minimal padding to avoid covering neighboring text
+      const rectPadding = 0.5
+      const descent = edit.pdfFontSize * 0.15
+      const ascent = edit.pdfFontSize * 0.85
       page.drawRectangle({
         x: edit.pdfX - rectPadding,
-        y: edit.pdfY - edit.pdfFontSize * 0.3 - rectPadding,
+        y: edit.pdfY - descent - rectPadding,
         width: edit.pdfWidth + rectPadding * 2,
-        height: edit.pdfFontSize * 1.3 + rectPadding * 2,
+        height: ascent + descent + rectPadding * 2,
         color: rgb(1, 1, 1), // white
         borderWidth: 0,
       })
