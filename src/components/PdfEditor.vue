@@ -352,19 +352,14 @@ async function savePdf() {
       page.getSize() // ensure page is valid
 
       // Draw a tight white rectangle over the original text to "erase" it
-      // Use minimal padding to cover antialiasing without obscuring neighboring text
-      const rectPadding = 1
-      // Use actual ascent from extracted PDF metrics (item.height = font ascent in PDF units)
+      // Zero padding — cover only the exact glyph area
       const ascent = edit.pdfHeight
-      // Derive accurate descent from pdf-lib font metrics
-      const fontTotalHeight = helveticaFont.heightAtSize(edit.pdfFontSize)
-      const fontAscentHeight = helveticaFont.heightAtSize(edit.pdfFontSize, { descender: false })
-      const descent = fontTotalHeight - fontAscentHeight
+      const descent = edit.pdfFontSize * 0.1
       page.drawRectangle({
-        x: edit.pdfX - rectPadding,
-        y: edit.pdfY - descent - rectPadding,
-        width: edit.pdfWidth + rectPadding * 2,
-        height: ascent + descent + rectPadding * 2,
+        x: edit.pdfX,
+        y: edit.pdfY - descent,
+        width: edit.pdfWidth,
+        height: ascent + descent,
         color: rgb(1, 1, 1), // white
         borderWidth: 0,
       })
