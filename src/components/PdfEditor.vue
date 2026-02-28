@@ -1,10 +1,7 @@
 <script setup>
 import { ref, nextTick, computed } from 'vue'
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib'
-import * as pdfjsLib from 'pdfjs-dist'
-
-// Set worker source - use CDN for reliable loading
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@4.4.168/build/pdf.worker.min.mjs`
+import pdfjsLib from '../pdfWorker.js'
 
 const pdfDoc = ref(null)
 const pdfBytes = ref(null)
@@ -737,7 +734,8 @@ function getCurrentPageTextItems() {
 .pdf-editor {
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  height: 100%;
+  flex: 1;
   background: #1a1a2e;
   color: #eee;
 }
