@@ -1,9 +1,7 @@
 <script setup>
 import { ref, computed } from 'vue'
 import { PDFDocument } from 'pdf-lib'
-import * as pdfjsLib from 'pdfjs-dist'
-
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@4.4.168/build/pdf.worker.min.mjs`
+import pdfjsLib from '../pdfWorker.js'
 
 // List of loaded PDF files
 const pdfFiles = ref([])
@@ -21,6 +19,8 @@ const thumbScale = 0.3
 const selectedPages = ref(new Set())
 // Whether we're in selection mode
 const selectionMode = ref(false)
+// Index for O(1) page entry lookup by 'fileId-pageIndex'
+const pageIndex = new Map()
 
 // Total page count
 const totalPageCount = computed(() => allPages.value.length)
@@ -50,7 +50,8 @@ async function handleFileUpload(event) {
 
       pdfFiles.value.push(fileEntry)
 
-      // Generate page entries with thumbnails
+      // Generate page entries and index them for O(1) lookup
+      const createdEntries = []
       for (let i = 0; i < pageCount; i++) {
         const pageEntry = {
           id: `${fileEntry.id}-page-${i}`,
@@ -61,9 +62,11 @@ async function handleFileUpload(event) {
           thumbnail: null,
         }
         allPages.value.push(pageEntry)
+        createdEntries.push(pageEntry)
+        pageIndex.set(`${fileEntry.id}-${i}`, pageEntry)
       }
 
-      // Generate thumbnails for this file
+      // Generate thumbnails for this file (O(1) per page via index)
       await generateThumbnails(bytes, fileEntry.id, pageCount)
     }
   } catch (error) {
@@ -96,12 +99,10 @@ async function generateThumbnails(bytes, fileId, pageCount) {
 
     const dataUrl = canvas.toDataURL('image/png')
 
-    // Find the matching page entry and set its thumbnail
-    const pageEntry = allPages.value.find(
-      (p) => p.fileId === fileId && p.pageIndex === i
-    )
-    if (pageEntry) {
-      pageEntry.thumbnail = dataUrl
+    // O(1) lookup via index instead of linear scan
+    const entry = pageIndex.get(`${fileId}-${i}`)
+    if (entry) {
+      entry.thumbnail = dataUrl
     }
   }
 }
@@ -193,6 +194,8 @@ function deleteSelected() {
   if (selectedPages.value.size === 0) return
   if (!confirm(`Delete ${selectedPages.value.size} selected page(s)?`)) return
 
+  const removed = allPages.value.filter((p) => selectedPages.value.has(p.id))
+  for (const p of removed) pageIndex.delete(`${p.fileId}-${p.pageIndex}`)
   allPages.value = allPages.value.filter((p) => !selectedPages.value.has(p.id))
   selectedPages.value = new Set()
 }
@@ -200,12 +203,23 @@ function deleteSelected() {
 // ---- Delete single page ----
 
 function deletePage(index) {
+  const p = allPages.value[index]
+  if (p) {
+    pageIndex.delete(`${p.fileId}-${p.pageIndex}`)
+    if (selectedPages.value.has(p.id)) {
+      const newSet = new Set(selectedPages.value)
+      newSet.delete(p.id)
+      selectedPages.value = newSet
+    }
+  }
   allPages.value.splice(index, 1)
 }
 
 // ---- Remove all pages from a source file ----
 
 function removeFile(fileId) {
+  const removed = allPages.value.filter((p) => p.fileId === fileId)
+  for (const p of removed) pageIndex.delete(`${p.fileId}-${p.pageIndex}`)
   allPages.value = allPages.value.filter((p) => p.fileId !== fileId)
   pdfFiles.value = pdfFiles.value.filter((f) => f.id !== fileId)
   // Clear selections that no longer exist
@@ -235,6 +249,7 @@ async function splitSelected() {
   isLoading.value = true
   try {
     const newPdf = await PDFDocument.create()
+    const srcDocCache = new Map()
 
     for (const page of allPages.value) {
       if (!selectedPages.value.has(page.id)) continue
@@ -242,7 +257,11 @@ async function splitSelected() {
       const sourceFile = pdfFiles.value.find((f) => f.id === page.fileId)
       if (!sourceFile) continue
 
-      const srcDoc = await PDFDocument.load(sourceFile.bytes)
+      if (!srcDocCache.has(page.fileId)) {
+        srcDocCache.set(page.fileId, await PDFDocument.load(sourceFile.bytes))
+      }
+      const srcDoc = srcDocCache.get(page.fileId)
+
       const [copiedPage] = await newPdf.copyPages(srcDoc, [page.pageIndex])
       newPdf.addPage(copiedPage)
     }
@@ -268,12 +287,17 @@ async function mergeAll() {
   isLoading.value = true
   try {
     const newPdf = await PDFDocument.create()
+    const srcDocCache = new Map()
 
     for (const page of allPages.value) {
       const sourceFile = pdfFiles.value.find((f) => f.id === page.fileId)
       if (!sourceFile) continue
 
-      const srcDoc = await PDFDocument.load(sourceFile.bytes)
+      if (!srcDocCache.has(page.fileId)) {
+        srcDocCache.set(page.fileId, await PDFDocument.load(sourceFile.bytes))
+      }
+      const srcDoc = srcDocCache.get(page.fileId)
+
       const [copiedPage] = await newPdf.copyPages(srcDoc, [page.pageIndex])
       newPdf.addPage(copiedPage)
     }
@@ -307,6 +331,7 @@ function clearAll() {
   pdfFiles.value = []
   allPages.value = []
   selectedPages.value = new Set()
+  pageIndex.clear()
 }
 
 // Source files summary

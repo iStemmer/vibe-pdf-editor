@@ -23,8 +23,9 @@ const activeTab = ref('editor')
       </button>
     </nav>
     <div class="tab-content">
-      <PdfEditor v-if="activeTab === 'editor'" />
-      <PdfMerger v-if="activeTab === 'merger'" />
+      <KeepAlive>
+        <component :is="activeTab === 'editor' ? PdfEditor : PdfMerger" :key="activeTab" />
+      </KeepAlive>
     </div>
   </div>
 </template>
