@@ -1,6 +1,6 @@
 <script setup>
 import { ref, nextTick, computed } from 'vue'
-import { PDFDocument, rgb, StandardFonts } from 'pdf-lib'
+import { PDFDocument, rgb } from 'pdf-lib'
 import pdfjsLib from '../pdfWorker.js'
 
 const pdfDoc = ref(null)
@@ -86,14 +86,126 @@ async function renderPage() {
   await extractTextItems(page, viewport)
 }
 
+// Map a PDF font family name to a CSS font-family stack
+function toCssFontFamily(fontFamily) {
+  if (!fontFamily) return 'Helvetica, Arial, sans-serif'
+  const lower = fontFamily.toLowerCase()
+  if (lower.includes('courier') || lower.includes('mono'))
+    return '"Courier New", Courier, monospace'
+  if (lower.includes('times') || lower.includes('serif') || lower.includes('roman'))
+    return '"Times New Roman", Times, serif'
+  return 'Helvetica, Arial, sans-serif'
+}
+
+// Detect bold / italic from font name string
+function detectFontTraits(fontName) {
+  const n = (fontName || '').toLowerCase()
+  return {
+    isBold: /bold|black|heavy|demi/i.test(n),
+    isItalic: /italic|oblique/i.test(n),
+  }
+}
+
+// Map a PDF font to the closest pdf-lib StandardFont name
+function toStandardFont(fontFamily, isBold, isItalic) {
+  const lower = (fontFamily || '').toLowerCase()
+  if (lower.includes('courier') || lower.includes('mono')) {
+    if (isBold && isItalic) return 'Courier-BoldOblique'
+    if (isBold) return 'Courier-Bold'
+    if (isItalic) return 'Courier-Oblique'
+    return 'Courier'
+  }
+  if (lower.includes('times') || lower.includes('roman')) {
+    if (isBold && isItalic) return 'Times-BoldItalic'
+    if (isBold) return 'Times-Bold'
+    if (isItalic) return 'Times-Italic'
+    return 'Times-Roman'
+  }
+  // Default to Helvetica family
+  if (isBold && isItalic) return 'Helvetica-BoldOblique'
+  if (isBold) return 'Helvetica-Bold'
+  if (isItalic) return 'Helvetica-Oblique'
+  return 'Helvetica'
+}
+
+// Sample text color by reading rendered pixels from the canvas at each text item's position.
+// This is more reliable than parsing the operator list, which has indexing mismatches
+// with getTextContent() and often picks up background fill colors (e.g. white).
+function sampleTextColor(canvasEl, item, viewport) {
+  const ctx = canvasEl.getContext('2d', { willReadFrequently: true })
+
+  // Sample pixels across the text area to find the dominant foreground color.
+  const tx = pdfjsLib.Util.transform(viewport.transform, item.transform)
+  const x = tx[4]
+  const y = tx[5]
+  const width = item.width * viewport.scale
+  const height = item.height * viewport.scale
+
+  const startX = Math.max(0, Math.round(x + 1))
+  const sampleWidth = Math.min(Math.round(Math.min(width, 80)), canvasEl.width - startX)
+  if (sampleWidth <= 0) return { r: 0, g: 0, b: 0 }
+
+  // Sample 3 horizontal rows at different heights within the glyph
+  const rows = [
+    Math.round(y - height * 0.5),  // top third
+    Math.round(y - height * 0.35), // middle
+    Math.round(y - height * 0.2),  // lower third
+  ]
+
+  let bestColor = { r: 0, g: 0, b: 0 }
+  let darkest = 255 * 3
+
+  for (const row of rows) {
+    if (row < 0 || row >= canvasEl.height) continue
+
+    // Read a strip of pixels in one call (much faster than per-pixel getImageData)
+    const imageData = ctx.getImageData(startX, row, sampleWidth, 1)
+    const data = imageData.data
+
+    for (let px = 0; px < sampleWidth; px++) {
+      const offset = px * 4
+      const r = data[offset]
+      const g = data[offset + 1]
+      const b = data[offset + 2]
+      const brightness = r + g + b
+      // Skip near-white pixels (likely background)
+      if (brightness > 740) continue
+      if (brightness < darkest) {
+        darkest = brightness
+        bestColor = { r: r / 255, g: g / 255, b: b / 255 }
+      }
+    }
+
+    // If we found a clear foreground pixel, no need to check more rows
+    if (darkest < 600) break
+  }
+
+  // If all sampled pixels were near-white, default to black (never save white text)
+  return bestColor
+}
+
 // Extract text items from the current page
 async function extractTextItems(page, viewport) {
   const textContent = await page.getTextContent()
+  const canvasEl = canvas.value
   const items = []
 
   for (let i = 0; i < textContent.items.length; i++) {
     const item = textContent.items[i]
+    // Skip marked-content items (they have a 'type' property, not 'str')
+    if (item.type) continue
     if (!item.str || item.str.trim() === '') continue
+
+    // Font info from styles dict
+    const style = textContent.styles[item.fontName] || {}
+    const fontFamily = style.fontFamily || ''
+    const traits = detectFontTraits(item.fontName)
+    const cssFontFamily = toCssFontFamily(fontFamily)
+    const standardFont = toStandardFont(fontFamily, traits.isBold, traits.isItalic)
+
+    // Sample actual rendered text color from the canvas
+    const color = sampleTextColor(canvasEl, item, viewport)
+    const cssColor = `rgb(${Math.round(color.r * 255)}, ${Math.round(color.g * 255)}, ${Math.round(color.b * 255)})`
 
     // Transform the text item position using the viewport
     const tx = pdfjsLib.Util.transform(viewport.transform, item.transform)
@@ -124,6 +236,14 @@ async function extractTextItems(page, viewport) {
       page: currentPage.value,
       isEdited: !!edited,
       fontName: item.fontName || 'Helvetica',
+      fontFamily,
+      cssFontFamily,
+      standardFont,
+      isBold: traits.isBold,
+      isItalic: traits.isItalic,
+      // Text color
+      color,
+      cssColor,
       // Store original PDF coordinates for saving
       pdfX: item.transform[4],
       pdfY: item.transform[5],
@@ -174,6 +294,11 @@ function finishEditingTextItem(item) {
       pdfWidth: item.pdfWidth,
       pdfHeight: item.pdfHeight,
       fontName: item.fontName,
+      fontFamily: item.fontFamily,
+      standardFont: item.standardFont,
+      isBold: item.isBold,
+      isItalic: item.isItalic,
+      color: item.color,
       page: item.page,
     }
   } else {
@@ -341,12 +466,32 @@ async function savePdf() {
   try {
     // Reload the original PDF to apply changes
     const newPdfDoc = await PDFDocument.load(pdfBytes.value)
-    const helveticaFont = await newPdfDoc.embedFont(StandardFonts.Helvetica)
+
+    // Cache embedded fonts to avoid re-embedding the same font multiple times
+    const fontCache = new Map()
+    async function getFont(standardFontName) {
+      if (!fontCache.has(standardFontName)) {
+        fontCache.set(standardFontName, await newPdfDoc.embedFont(standardFontName))
+      }
+      return fontCache.get(standardFontName)
+    }
 
     // Apply edited existing text items
     for (const [, edit] of Object.entries(editedTextItems.value)) {
       const page = newPdfDoc.getPage(edit.page - 1)
       page.getSize() // ensure page is valid
+
+      // Use the matched standard font (or fallback to Helvetica)
+      const font = await getFont(edit.standardFont || 'Helvetica')
+
+      // Preserve original text color (or fallback to black)
+      const textColor = edit.color
+        ? rgb(
+            Math.max(0, Math.min(1, edit.color.r)),
+            Math.max(0, Math.min(1, edit.color.g)),
+            Math.max(0, Math.min(1, edit.color.b)),
+          )
+        : rgb(0, 0, 0)
 
       // Draw a tight white rectangle over the original text to "erase" it
       // Zero padding — cover only the exact glyph area
@@ -361,17 +506,19 @@ async function savePdf() {
         borderWidth: 0,
       })
 
-      // Draw the new text
+      // Draw the new text with matched font and color
       page.drawText(edit.text, {
         x: edit.pdfX,
         y: edit.pdfY,
         size: edit.pdfFontSize,
-        font: helveticaFont,
-        color: rgb(0, 0, 0),
+        font,
+        color: textColor,
       })
     }
 
-    // Apply new text overlays to the PDF
+    // Apply new text overlays to the PDF (these use Helvetica by default)
+    const helveticaFont = await getFont('Helvetica')
+
     for (const overlay of textOverlays.value) {
       const page = newPdfDoc.getPage(overlay.page - 1)
       const { height } = page.getSize()
@@ -566,6 +713,9 @@ function getCurrentPageTextItems() {
               height: item.height + 'px',
               fontSize: item.fontSize + 'px',
               lineHeight: item.height + 'px',
+              fontFamily: item.cssFontFamily,
+              fontWeight: item.isBold ? 'bold' : 'normal',
+              fontStyle: item.isItalic ? 'italic' : 'normal',
             }"
             @click="selectTextItem($event, item)"
             @dblclick="startEditingTextItem($event, item)"
@@ -577,6 +727,10 @@ function getCurrentPageTextItems() {
                 fontSize: item.fontSize + 'px',
                 width: Math.max(item.width, 100) + 'px',
                 height: item.height + 'px',
+                fontFamily: item.cssFontFamily,
+                fontWeight: item.isBold ? 'bold' : 'normal',
+                fontStyle: item.isItalic ? 'italic' : 'normal',
+                color: item.cssColor,
               }"
               class="text-item-input"
               @blur="finishEditingTextItem(item)"
@@ -937,7 +1091,6 @@ canvas {
 
 .existing-text-item.edited .text-item-label {
   color: rgba(233, 69, 96, 0.6);
-  font-weight: bold;
 }
 
 .text-item-input {
@@ -946,7 +1099,6 @@ canvas {
   left: 0;
   border: 2px solid #4287f5;
   background: rgba(255, 255, 255, 0.95);
-  color: #000;
   padding: 0 2px;
   outline: none;
   z-index: 20;
