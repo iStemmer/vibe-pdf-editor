@@ -30,7 +30,7 @@ Edit text, merge files, split pages, and rearrange — all inside your browser.
 - **Selection mode** — bulk-select pages for split or delete operations.
 
 ---
-
+Here is link for the online version: https://istemmer.github.io/vibe-pdf-editor/
 ## 🚀 Getting Started
 
 ### Prerequisites
